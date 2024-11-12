@@ -1,0 +1,16 @@
+# Ignore the virtual environment folder
+venv/
+
+# Ignore environment files
+.env
+
+# Ignore large model files
+*.pt
+*.h5
+
+# Ignore any specific folder or file
+path/to/largefile.extension
+path/to/largefolder/
+
+
+yolov10/Lib/site-packages/
