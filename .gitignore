@@ -1,16 +1,18 @@
-# Ignore the virtual environment folder
+# Python
 venv/
+__pycache__/
+*.pyc
 
-# Ignore environment files
+# Secrets
 .env
+frontend/.env
 
-# Ignore large model files
-*.pt
-*.h5
+# Runtime output
+detection_log.log
+detections.jsonl
+results/
+runs/
 
-# Ignore any specific folder or file
-path/to/largefile.extension
-path/to/largefolder/
-
-
-yolov10/Lib/site-packages/
+# Frontend
+frontend/node_modules/
+frontend/build/

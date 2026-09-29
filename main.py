@@ -1,197 +1,167 @@
-import cv2
+"""Live trash counter: camera -> YOLOv10 -> DeepSORT -> count, with a small FastAPI server.
+
+Run:  python main.py
+Settings come from environment variables (see .env.example).
+"""
+import asyncio
+import datetime
+import json
 import logging
 import os
-from fastapi import FastAPI, WebSocket, Request
+import threading
+import time
+
+import cv2
 import uvicorn
-from threading import Thread
-import asyncio
-from pydantic import BaseModel
-from detection.yolo_model import load_model
-from detection.detection import perform_detection
-from tracking.tracking import TrackerManager
-from utils.camera import initialize_camera
-from utils.alert_system import check_trash_threshold
 from dotenv import load_dotenv
-from fastapi.responses import JSONResponse
-import datetime
-import random  # For generating mock pH data
-from aws_integration import upload_to_s3
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# Set up logging configuration
-logging.basicConfig(
-    filename='detection_log.log',
-    level=logging.INFO,
-    format='%(asctime)s,INFO:%(message)s'  # Ensure consistent logging format for Lambda parsing
-)
+from pipeline import CounterState, TrashCounter
+from utils.alert_system import send_alert
+from utils.camera import initialize_camera
 
-# Load environment variables from .env file
 load_dotenv()
 
-# Load environment variables
 MODEL_PATH = os.getenv("MODEL_PATH", "models/best_one_class.pt")
-TRASH_THRESHOLD = int(os.getenv("TRASH_THRESHOLD", 1))
+CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.25"))
+TRASH_THRESHOLD = int(os.getenv("TRASH_THRESHOLD", "5"))
+CAMERA_SOURCE = os.getenv("CAMERA_SOURCE", "0")
+SHOW_WINDOW = os.getenv("SHOW_WINDOW", "false").lower() == "true"
+EVENTS_FILE = os.getenv("EVENTS_FILE", "detections.jsonl")
 S3_BUCKET = os.getenv("S3_BUCKET")
+API_KEY = os.getenv("API_KEY")  # if set, POST endpoints require an X-API-Key header
+MAX_FAILED_READS = 50
 
-# Global variable to store the total objects detected
-total_objects_detected = 0
+logging.basicConfig(
+    filename="detection_log.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
-app = FastAPI()
-
-# CORS Middleware setup
+state = CounterState()
+app = FastAPI(title="Trash Detection API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # React frontend URL
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
-# Middleware for error handling
-@app.middleware("http")
-async def error_handling_middleware(request: Request, call_next):
-    try:
-        response = await call_next(request)
-        return response
-    except Exception as e:
-        logging.error(f"An error occurred: {e}")
-        return JSONResponse(status_code=500, content={"detail": str(e)})
 
-# Model for pH data logging
-class pHData(BaseModel):
+def _check_key(x_api_key):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="invalid API key")
+
+
+class PHReading(BaseModel):
     pH: float
+    sensor_id: str
 
-# Model for trash count data logging
-class TrashData(BaseModel):
-    count: int
 
-# Endpoint to log pH data
 @app.post("/log-ph")
-def log_ph(data: pHData):
-    logging.info(f"pH data received: {data.pH}")
-    return {"status": "success", "data": data}
+def log_ph(reading: PHReading, x_api_key: str | None = Header(default=None)):
+    """For a real pH sensor only. Nothing in this repo generates pH values."""
+    _check_key(x_api_key)
+    if not 0 <= reading.pH <= 14:
+        raise HTTPException(status_code=422, detail="pH must be between 0 and 14")
+    logging.info("sensor_ph sensor_id=%s value=%.2f", reading.sensor_id, reading.pH)
+    return {"status": "success"}
 
-# Endpoint to log trash count data
-@app.post("/log-trash-count")
-def log_trash_count(data: TrashData):
-    logging.info(f"Received trash count data: {data.count}")
-    return {"status": "success", "data": data}
 
-# Health check endpoint
 @app.get("/health")
-def health_check():
+def health():
     return {"status": "healthy"}
 
-def get_current_trash_count():
-    global total_objects_detected
-    return total_objects_detected
-
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the Trash Detection API"}
 
 @app.get("/status")
-def get_status():
-    return {"status": "Monitoring"}
+def status():
+    return {"status": "Monitoring", "model": os.path.basename(MODEL_PATH), "conf_threshold": CONF_THRESHOLD}
+
 
 @app.get("/trash-count")
-def get_trash_count():
-    return {"count": get_current_trash_count()}
+def trash_count():
+    snap = state.snapshot()
+    return {"count": snap["total"], **snap}
+
 
 @app.websocket("/ws/trash-count")
-async def websocket_endpoint(websocket: WebSocket):
+async def ws_trash_count(websocket: WebSocket):
     await websocket.accept()
-    while True:
-        trash_count = get_current_trash_count()
-        await websocket.send_json({"count": trash_count})
-        await asyncio.sleep(5)
+    try:
+        while True:
+            snap = state.snapshot()
+            await websocket.send_json({"count": snap["total"], **snap})
+            await asyncio.sleep(2)
+    except WebSocketDisconnect:
+        pass
 
-def generate_mock_ph_value():
-    """Generate a random pH value between 6.5 and 8.5."""
-    return round(random.uniform(6.5, 8.5), 2)
+
+def _upload_events():
+    if not S3_BUCKET:
+        return
+    from aws_integration import upload_to_s3
+    key = f"events/{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_detections.jsonl"
+    ok = upload_to_s3(EVENTS_FILE, S3_BUCKET, key)
+    logging.info("s3_upload key=%s ok=%s", key, ok)
+
 
 def detection_loop():
-    global total_objects_detected
+    counter = TrashCounter(MODEL_PATH, CONF_THRESHOLD)
+    cap = initialize_camera(CAMERA_SOURCE)
+    failed_reads = 0
 
-    try:
-        model = load_model(MODEL_PATH)
-    except Exception as e:
-        logging.error(f"Failed to load model from {MODEL_PATH}: {e}")
-        return
+    with open(EVENTS_FILE, "a") as events_out:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                if not CAMERA_SOURCE.isdigit():  # a video file simply ended
+                    logging.info("video_ended source=%s total=%d", CAMERA_SOURCE, state.snapshot()["total"])
+                    break
+                failed_reads += 1
+                if failed_reads >= MAX_FAILED_READS:
+                    logging.error("camera_lost failed_reads=%d, stopping", failed_reads)
+                    break
+                time.sleep(0.1)
+                continue
+            failed_reads = 0
 
-    try:
-        cap = initialize_camera()
-    except Exception as e:
-        logging.error(f"Failed to initialize camera: {e}")
-        return
+            tracks, events = counter.process(frame)
+            for ev in events:
+                record = {"timestamp": datetime.datetime.now().isoformat(timespec="seconds"), **ev.__dict__}
+                events_out.write(json.dumps(record) + "\n")
+                logging.info("counted track_id=%s class=%s conf=%.3f", ev.track_id, ev.class_name, ev.confidence)
+            if events:
+                events_out.flush()
+                state.add(len(events))
 
-    tracker_manager = TrackerManager()
-    counted_ids = set()
+            snap = state.snapshot()
+            if snap["since_last_alert"] >= TRASH_THRESHOLD:
+                send_alert(f"Trash alert: {snap['since_last_alert']} new item(s) detected ({snap['total']} total).")
+                logging.info("alert_queued since_last_alert=%d threshold=%d", snap["since_last_alert"], TRASH_THRESHOLD)
+                state.reset_alert_window()
+                threading.Thread(target=_upload_events, daemon=True).start()
 
-    while True:
-        try:
-            ret, frame = cap.read()
-            if not ret:
-                logging.warning("Failed to read frame from camera")
-                continue  # Skip this loop iteration if frame is not captured
-
-            # Perform detection and edge detection
-            detections, edges = perform_detection(model, frame)
-            tracked_objects = tracker_manager.update(detections, frame)
-
-            for track in tracked_objects:
-                track_id = track.track_id
-
-                if track_id not in counted_ids:
-                    counted_ids.add(track_id)
-                    total_objects_detected += 1
-                    # Log the detection event
-                    logging.info(f"Detection: Track ID {track_id}, Total Trash Detected: {total_objects_detected}")
-
-                bbox = track.to_tlbr()
-                cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (255, 0, 0), 2)
-                cv2.putText(frame, f'Track ID: {track_id}', (int(bbox[0]), int(bbox[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2)
-
-            # Generate and log mock pH data
-            ph_value = generate_mock_ph_value()
-            logging.info(f"pH data received: {ph_value}")
-
-            # Check if the total detected trash count exceeds the threshold
-            if check_trash_threshold(total_objects_detected):
-                logging.info(f"Alert triggered: {total_objects_detected} item(s) of trash detected, threshold was {TRASH_THRESHOLD}")
-                total_objects_detected = 0  # Optionally reset the count after sending the alert
-
-                # When the trash threshold is exceeded, upload the log file to S3
-                local_file = "detection_log.log"
-                s3_file = f"logs/{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_log.log"
-
-                # Upload the file to S3
-                if local_file and S3_BUCKET and s3_file:
-                    success = upload_to_s3(local_file, S3_BUCKET, s3_file)
-                    if success:
-                        logging.info(f"Successfully uploaded {local_file} to {s3_file}")
-                    else:
-                        logging.error(f"Failed to upload {local_file} to S3.")
-                else:
-                    logging.error("Missing required parameters for S3 upload.")
-
-            # Display the edges
-            cv2.imshow('Edges', edges)
-
-            # Display the original frame with detections
-            cv2.putText(frame, f"Total Trash Detected: {total_objects_detected}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.imshow('Webcam', frame)
-
-            if cv2.waitKey(1) & 0xFF == 27:
-                break
-        except Exception as e:
-            logging.error(f"An error occurred during detection: {e}")
+            if SHOW_WINDOW:
+                for t in tracks:
+                    l, t_, r, b = (int(v) for v in t.to_ltrb())
+                    cv2.rectangle(frame, (l, t_), (r, b), (255, 0, 0), 2)
+                    cv2.putText(frame, f"ID {t.track_id}", (l, t_ - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                cv2.putText(frame, f"Total: {snap['total']}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                cv2.imshow("Trash detector", frame)
+                if cv2.waitKey(1) & 0xFF == 27:  # Esc quits
+                    break
 
     cap.release()
-    cv2.destroyAllWindows()
+    if SHOW_WINDOW:
+        cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
-    detection_thread = Thread(target=detection_loop)
-    detection_thread.start()
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # The API runs in a background thread so OpenCV windows stay on the main thread (required on macOS).
+    server = threading.Thread(
+        target=uvicorn.run, kwargs={"app": app, "host": os.getenv("HOST", "127.0.0.1"), "port": 8000}, daemon=True
+    )
+    server.start()
+    detection_loop()

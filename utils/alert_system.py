@@ -1,32 +1,43 @@
+"""WhatsApp alerts via Twilio, sent from a background thread so the video loop never blocks."""
+import logging
 import os
-from twilio.rest import Client
-from dotenv import load_dotenv
+import queue
+import threading
 
-# Load environment variables from .env file
-load_dotenv()
+_client = None
+_queue: "queue.Queue[str]" = queue.Queue()
+_worker_started = False
 
-# Load environment variables for Twilio credentials
-ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
-RECIPIENT_NUMBER = os.getenv("RECIPIENT_NUMBER")
 
-# Initialize the Twilio client with the correct variables
-client = Client(ACCOUNT_SID, AUTH_TOKEN)
+def _get_client():
+    global _client
+    if _client is None:
+        sid, token = os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN")
+        if not (sid and token):
+            return None
+        from twilio.rest import Client
+        _client = Client(sid, token)
+    return _client
 
-def send_whatsapp_alert(message):
-    try:
-        message = client.messages.create(
-            body=message,
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=RECIPIENT_NUMBER
-        )
-        print(f"WhatsApp message sent: {message.sid}")
-    except Exception as e:
-        print(f"Failed to send WhatsApp message: {e}")
 
-def check_trash_threshold(current_count):
-    if current_count >= int(os.getenv("TRASH_THRESHOLD", 5)):  # Get threshold from env or use default
-        send_whatsapp_alert(f"Alert: The trash collector has detected {current_count} item(s) of trash.")
-        return True
-    return False
+def _worker():
+    while True:
+        body = _queue.get()
+        client = _get_client()
+        sender, recipient = os.getenv("TWILIO_WHATSAPP_NUMBER"), os.getenv("RECIPIENT_NUMBER")
+        if not (client and sender and recipient):
+            logging.warning("alert_skipped reason=twilio_not_configured message=%r", body)
+            continue
+        try:
+            msg = client.messages.create(body=body, from_=sender, to=recipient)
+            logging.info("alert_sent sid=%s", msg.sid)
+        except Exception as e:  # network or Twilio error; keep the worker alive
+            logging.error("alert_failed error=%s", e)
+
+
+def send_alert(message: str):
+    global _worker_started
+    if not _worker_started:
+        threading.Thread(target=_worker, daemon=True).start()
+        _worker_started = True
+    _queue.put(message)
